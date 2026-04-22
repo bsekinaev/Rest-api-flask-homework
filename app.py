@@ -1,98 +1,104 @@
-from flask import Flask, request, jsonify, g
-from models import db, Ads, User
-from flask_httpauth import HTTPBasicAuth
+from aiohttp import web
+from models import init_db, create_user, get_user_by_email, create_ad, get_ad, update_ad, delete_ad, is_ad_owner
+from auth import login_required
 
-app = Flask(__name__)
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///ads.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
-db.init_app(app)
-auth = HTTPBasicAuth()
+app = web.Application()
 
-with app.app_context():
-    db.create_all()
+async def on_startup(app):
+    await init_db()
+    print('База данных готова')
 
-# Проверка пользователя Basic Auth
-@auth.verify_password
-def verify_password(email, password):
-    user = User.query.filter_by(email=email).first()
-    if user and user.check_password(password):
-        g.current_user = user
-        return True
-    return False
+app.on_startup.append(on_startup)
 
-# Регистрация нового пользователя
-@app.route('/register', methods=['POST'])
-def register():
-    data = request.get_json()
-    if not data or not all(k in data for k in ('email','password')):
-        return jsonify({'Ошибка': 'Email или пароль отсутствует'}), 400
-    if User.query.filter_by(email=data['email']).first():
-        return jsonify({'Ошибка': 'Пользователь уже существует'}), 409
-    user = User(email=data['email'])
-    user.set_password(data['password'])
-    db.session.add(user)
-    db.session.commit()
-    return jsonify(user.to_dict()), 201
+async def register(request):
+    try:
+        data = await request.json()
+    except:
+        return web.json_response({'Ошибка': 'Некорректный JSON'}, status=400)
 
-# Создание
-@app.route('/ads', methods=['POST'])
-@auth.login_required
-def create_ad():
-    data = request.get_json()
-    if not data or not all(k in data for k in ('title', 'description')):
-        return jsonify({'Ошибка': "Неверные данные"}), 400
-    ad = Ads(
-        title=data["title"],
-        description=data["description"],
-        owner_id=g.current_user.id
-    )
-    db.session.add(ad)
-    db.session.commit()
-    return jsonify(ad.to_dict()), 201
+    email = data.get('email')
+    password = data.get('password')
+    if not email or not password:
+        return web.json_response({'Ошибка': 'Требуется адрес электронной почты и пароль'}, status=400)
 
+    existing = await get_user_by_email(email)
+    if existing:
+        return web.json_response({"Ошибка": "Пользователь с таким Email уже существует"}, status=409)
 
-# Получение
-@app.route("/ads/<int:ad_id>", methods=["GET"])
-def get_ad(ad_id):
-    ad = Ads.query.get(ad_id)
+    success = await create_user(email, password)
+    if not success:
+        return web.json_response({"Ошибка": "Не удалось создать пользователя"}, status=500)
+
+    return web.json_response({"Уведомление": "Пользователь создан"}, status=200)
+
+@login_required
+async def create_ad_handler(request):
+    try:
+        data = await request.json()
+    except:
+        return web.json_response({"Ошибка": "Некорректный JSON"}, status=400)
+
+    title = data.get('title')
+    description = data.get('description')
+    if not title or not description:
+        return web.json_response({"Ошибка": "Требуется ввести название и описание объявления"}, status=400)
+
+    user = request.user
+    ad_id = await create_ad(title, description, user['id'])
+    ad = await get_ad(ad_id)
+    if ad is None:
+        return web.json_response({"Ошибка": "Не удалось создать объявление"}, status=500)
+    return web.json_response(ad, status=201)
+
+async def get_ad_handler(request):
+    ad_id = int(request.match_info['ad_id'])
+    ad = await get_ad(ad_id)
     if not ad:
-        return jsonify({"Ошибка": "Объявление не найдено!"}), 404
-    return jsonify(ad.to_dict())
+        return web.json_response({"Ошибка": "Объявление не найдено"}, status=404)
+    return web.json_response(ad)
 
-
-# Редактирование
-@app.route('/ads/<int:ad_id>', methods=['PUT'])
-@auth.login_required
-def update_ad(ad_id):
-    ad = Ads.query.get(ad_id)
+@login_required
+async def update_ad_handler(request):
+    ad_id = int(request.match_info['ad_id'])
+    ad = await get_ad(ad_id)
     if not ad:
-        return jsonify({"Ошибка": "Объявление не найдено!"}), 404
-    if ad.owner_id != g.current_user.id:
-        return jsonify({'Ошибка':'Вы можете редактировать только свои объявления'}), 403
-    data = request.get_json()
-    if not data:
-        return jsonify({"Ошибка": "Неверные данные"}), 400
-    if 'title' in data:
-        ad.title = data["title"]
-    if 'description' in data:
-        ad.description = data["description"]
-    db.session.commit()
-    return jsonify(ad.to_dict())
+        return web.json_response({"Ошибка": "Объявление не найдено"}, status=404)
 
+    if not await is_ad_owner(ad_id, request.user['id']):
+        return web.json_response({"Ошибка": "Вы можете редактировать только свои объявления"}, status=403)
 
-# Удаление
-@app.route('/ads/<int:ad_id>', methods=['DELETE'])
-@auth.login_required
-def delete_ad(ad_id):
-    ad = Ads.query.get(ad_id)
+    try:
+        data = await request.json()
+    except:
+        return web.json_response({"Ошибка": "Некорректный JSON"}, status=400)
+
+    title = data.get('title')
+    description = data.get('description')
+    if title is None and description is None:
+        return web.json_response({"Ошибка": "Ничего не изменилось"}, status=400)
+
+    await update_ad(ad_id, title, description)
+    updated_ad = await get_ad(ad_id)
+    return web.json_response(updated_ad)
+
+@login_required
+async def delete_ad_handler(request):
+    ad_id = int(request.match_info['ad_id'])
+    ad = await get_ad(ad_id)
     if not ad:
-        return jsonify({"Ошибка": "Объявление не найдено"}), 404
-    if ad.owner_id != g.current_user.id:
-        return jsonify({'Ошибка':"Нет прав на удаление"}), 403
-    db.session.delete(ad)
-    db.session.commit()
-    return jsonify({"Сообщения": "Успешно удалено"}), 200
+        return web.json_response({"Ошибка": "Объявление не найдено"}, status=404)
 
+    if not await is_ad_owner(ad_id, request.user['id']):
+        return web.json_response({"Ошибка": "Вы можете удалять только свои объявления"}, status=403)
+
+    await delete_ad(ad_id)
+    return web.json_response({'Уведомление': 'Объявление удалено'}, status=200)
+
+app.router.add_post('/register', register)
+app.router.add_post('/ads', create_ad_handler)
+app.router.add_get('/ads/{ad_id}', get_ad_handler)
+app.router.add_put('/ads/{ad_id}', update_ad_handler)
+app.router.add_delete('/ads/{ad_id}', delete_ad_handler)
 
 if __name__ == '__main__':
-    app.run(debug=True)
+    web.run_app(app, host='0.0.0.0', port=8080)
